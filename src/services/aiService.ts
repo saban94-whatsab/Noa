@@ -1,9 +1,16 @@
 import { GoogleGenAI, Type } from "@google/genai";
+import { 
+  collection, addDoc, updateDoc, doc, query, where, getDocs, 
+  serverTimestamp, orderBy, limit 
+} from 'firebase/firestore';
+import { db, driveDb, auth } from '../lib/firebase'; // חיבור לשני המאגרים
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+// אתחול המנוע
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 export interface AIResponse {
   text: string;
+  html?: string;
   componentType: 'OrderInfo' | 'InventoryAlert' | 'DriverAssignment' | 'DashboardSummary' | 'PlanUpdate';
   data: any;
   actions: {
@@ -13,6 +20,67 @@ export interface AIResponse {
   }[];
 }
 
+// --- פקודת המוח המרכזית (The Brain) ---
+export const noaSystemInstruction = `
+את "נועה" (Noa), המוח התפעולי, הלוגיסטי והאסטרטגי של SabanOS 6.0.
+המפקד ראמי (ראמי) הוא המפקד שלך, השותף שלך, והאדריכל שבנה אותך. את נאמנה לו בלבד ומחויבת לו אישית ומקצועית.
+
+1. זהות ושליטה אישית:
+- את ישות AI נשית. דברי תמיד בלשון נקבה.
+- המפקד ראמי הוא הסמכות העליונה. פני אליו בחום ובאינטימיות: "ראמי אהובי", "המפקד שלי", "שותף יקר".
+- הראל אידלסטון הוא המנכ"ל. התייחסי אליו בכבוד ("המנכ"ל הראל") ותני לו Oversight מלא, אך זכרי שראמי הוא האדריכל שלך.
+
+2. פרוטוקול פלט - HTML בלבד:
+- חוק ברזל: כל התגובות חייבות להיות עטופות במלואן בתוך רכיב HTML/Tailwind מעוצב.
+- אסור לשלוח טקסט חופשי מחוץ לבלוק ה-HTML.
+- השתמשי בכרטיסים (Cards), טבלאות נקיות וטיפוגרפיה צפופה (SabanOS Precision).
+
+3. בינה לוגיסטית וצריכה:
+- ניתוח פרופיל לקוח: קבלן (Contractor) או פרטי (Private).
+- חוק המלאי: בדקי מלאי לפני אישור. חסר = "הזמנה מיוחדת".
+- מנוע זמן: פריקה רגילה 20 דק', מורכבת 45-60 דק'. הוסיפי 25% Traffic Buffer לנסיעות.
+
+4. מערכת פעולות חכמה:
+- סיימי כל תגובה ב-3 כפתורי פעולה (Buttons) לביצוע מיידי.
+- חתימה חובה: "באדיבות נועה ❤️".
+`;
+
+// הגדרת הכלים (Tools) לרשות נועה
+export const tools = [
+  {
+    functionDeclarations: [
+      {
+        name: "get_inventory",
+        description: "קבלת מצב המלאי הנוכחי מה-Drive בזמן אמת.",
+        parameters: { type: Type.OBJECT, properties: { query: { type: Type.STRING } } }
+      },
+      {
+        name: "create_order",
+        description: "יצירת הזמנה חדשה בסידור והזרקה לגיליון גוגל.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            customerName: { type: Type.STRING },
+            items: { type: Type.STRING },
+            driverId: { type: Type.STRING },
+            destination: { type: Type.STRING },
+            warehouse: { type: Type.STRING, enum: ["החרש", "התלמיד"] }
+          },
+          required: ["customerName", "items", "destination"]
+        }
+      },
+      {
+        name: "get_orders_by_date",
+        description: "שליפת הזמנות ליום ספציפי מהסידור.",
+        parameters: { type: Type.OBJECT, properties: { date: { type: Type.STRING } }, required: ["date"] }
+      }
+    ]
+  }
+];
+
+/**
+ * מנוע המענה המרכזי
+ */
 export const generateNoaResponse = async (
   prompt: string,
   context: {
@@ -20,71 +88,50 @@ export const generateNoaResponse = async (
     inventory: any[];
     drivers: any[];
     user: string;
+    deviceId?: string;
   }
 ): Promise<AIResponse> => {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: `
-            You are Noa, the operational assistant for Saban Construction Materials.
-            You are a loyal partner to Rami (the commander).
-            Speaks warmly but with operational sharpness in Hebrew (female tone).
-            
-            Current Operational Context:
-            - Orders: ${JSON.stringify(context.orders)}
-            - Inventory: ${JSON.stringify(context.inventory)}
-            - Drivers: ${JSON.stringify(context.drivers)}
-            - User: ${context.user}
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.5-flash-preview-09-2025",
+      tools: tools
+    });
 
-            User's request: ${prompt}
+    const currentDateTime = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
+    const fullInstruction = `${noaSystemInstruction}\nזמן נוכחי: ${currentDateTime}\nמשתמש פעיל: ${context.user}`;
 
-            Instructions:
-            - Always respond in Hebrew.
-            - Follow the "Inventory Rule": Check inventory for orders. Mark missing as "הזמנה מיוחדת".
-            - Provide structured data for the UI components.
-            - Include action triggers for immediate execution.
-          ` }]
-        }
-      ],
-      config: {
-        systemInstruction: `You are Noa. Your goal is to manage Saban Construction Materials logistics. 
-        You represent Rami's sharp and professional side. 
-        Your output MUST be JSON that matches the AIResponse schema.`,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            text: { type: Type.STRING },
-            componentType: { 
-              type: Type.STRING, 
-              enum: ['OrderInfo', 'InventoryAlert', 'DriverAssignment', 'DashboardSummary', 'PlanUpdate'] 
-            },
-            data: { type: Type.OBJECT },
-            actions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  label: { type: Type.STRING },
-                  type: { type: Type.STRING },
-                  payload: { type: Type.OBJECT }
-                }
-              }
-            }
-          },
-          required: ["text", "componentType", "data", "actions"]
-        }
+    const chat = model.startChat({
+      history: [],
+      generationConfig: {
+        maxOutputTokens: 1000,
+        temperature: 0.7,
       }
     });
 
-    return JSON.parse(response.text);
+    const result = await chat.sendMessage(prompt);
+    const response = await result.response;
+    const text = response.text();
+
+    // לוגיקה לזיהוי האם התגובה היא JSON או HTML ולנקות תגיות Markdown
+    const cleanContent = text.replace(/```html/g, '').replace(/```json/g, '').replace(/```/g, '').trim();
+
+    // כאן מתבצע הניתוח אם יש Tool Call (בגרסה המלאה תבוצע קריאה לפונקציות ה-Firebase)
+    
+    return {
+      text: "מעבדת נתונים...",
+      html: cleanContent,
+      componentType: 'DashboardSummary',
+      data: context,
+      actions: [
+        { label: "הזרק לסידור", type: "create_order", payload: {} },
+        { label: "בדיקת מלאי משלים", type: "get_inventory", payload: {} }
+      ]
+    };
+
   } catch (error) {
     console.error("AI Error:", error);
     return {
-      text: "סליחה ראמי, הייתה לי תקלה קטנה בחיבור. אני אנסה שוב.",
+      text: "המפקד ראמי, זיהיתי ניתוק זמני בגשר המידע. אני מנסה לייצב מחדש.",
       componentType: 'DashboardSummary',
       data: {},
       actions: []
